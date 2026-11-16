@@ -1,0 +1,44 @@
+name: fx-feed
+
+# 每 5 分钟抓一次招行牌价。GitHub 的免费 cron 本来就会排队延迟，
+# 实测有效间隔常在 5–15 分钟 —— 对汇率足够（一天波动也就几十个基点）。
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # 手动跑一次，装完先验证
+
+permissions:
+  contents: write
+
+# 上一轮没跑完就别再开一轮，避免两个 job 同时 push 打架
+concurrency:
+  group: fx-feed
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 抓牌价
+        run: node scripts/fetch.mjs
+
+      - name: 有变化才提交
+        run: |
+          git config user.name  "fx-feed-bot"
+          git config user.email "fx-feed-bot@users.noreply.github.com"
+          git add fx.json
+          # 🔴 先 add 再 diff --cached：文件还没被跟踪时 `git diff` 恒为空，
+          # 第一轮会被误判成「没变化」而什么都不提交。
+          if git diff --cached --quiet; then
+            echo "牌价没变，跳过提交"
+            exit 0
+          fi
+          git commit -m "fx $(date -u +%FT%TZ)"
+          git push
