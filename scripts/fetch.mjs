@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 招商银行外汇牌价 → fx.json（GitHub Actions 每 5 分钟跑一次）
+ * 招商银行外汇牌价 → fx.json（GitHub Actions 每小时跑一次）
  *
  * 为什么要有这个仓库：招行牌价接口没有 CORS 头，浏览器直接 fetch 会被拦。
  * 浏览器拦的是「响应里没给 access-control-allow-origin」，不是请求发不出去 ——
