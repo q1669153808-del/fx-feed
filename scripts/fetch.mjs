@@ -15,12 +15,19 @@
  * 数值是「每 100 外币兑人民币」（ccyExc=10），要除以 100。
  */
 import { writeFileSync } from 'node:fs'
+import dns from 'node:dns'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const API = 'https://fx.cmbchina.com/api/v1/fx/rate?t='
 const OUT = join(dirname(fileURLToPath(import.meta.url)), '..', 'fx.json')
-const TIMEOUT_MS = 20000
+const TIMEOUT_MS = 15000
+
+/* 🔴 第 266 轮：2026-11-25 上午起，GitHub runner 抓价连续失败（注解只有一句 `fetch failed`），
+   同一份代码在本机 0.2 秒拿到价 —— 不是接口改版，是**海外出口到招行这条线不稳**。
+   两处兜底：① IPv4 优先（runner 偶发拿到不可达的 IPv6 地址，白等一轮超时）；
+   ② 直连失败后走 r.jina.ai 中转（实测海外可通，返回体带几行前缀，截 {} 再解析）。 */
+try { dns.setDefaultResultOrder('ipv4first') } catch { /* 老 Node 没这 API */ }
 
 /** 8 位小数：JPY 是 0.0415945，截到 6 位就丢有效数字；USD 6.65906 也不受影响 */
 const p8 = (x) => {
@@ -47,29 +54,53 @@ function isoDate(s) {
  */
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 
-async function main() {
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), TIMEOUT_MS)
-  let json
-  try {
-    const r = await fetch(API + Date.now(), {
-      signal: ac.signal,
-      headers: {
-        'user-agent': UA,
-        accept: 'application/json, text/plain, */*',
-        referer: 'https://fx.cmbchina.com/',
-      },
-    })
-    if (!r.ok) {
-      /* 把响应体前 160 字带上：招行拒绝时返回的是 HTML 拦截页，
-         光看 `HTTP 403` 分不清是风控还是接口挂了 */
-      const body = await r.text().catch(() => '')
-      throw new Error(`HTTP ${r.status} ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`)
+/**
+ * 取一次牌价 JSON。直连失败自动换 r.jina.ai 中转；两个都失败才抛，
+ * 错误里带底层 `code`（ECONNRESET / ENOTFOUND / UND_ERR_CONNECT_TIMEOUT），
+ * 否则 Actions 页面上永远只有一句 `fetch failed`，分不清是断网还是被拦。
+ */
+async function getRateJson() {
+  const t0 = Date.now()
+  const tries = [
+    { name: '直连', url: API + t0 },
+    { name: 'jina', url: `https://r.jina.ai/${API}${t0}`, wrap: true },
+  ]
+  const errs = []
+  for (const t of tries) {
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), TIMEOUT_MS)
+    try {
+      const r = await fetch(t.url, {
+        signal: ac.signal,
+        headers: {
+          'user-agent': UA,
+          accept: 'application/json, text/plain, */*',
+          referer: 'https://fx.cmbchina.com/',
+        },
+      })
+      if (!r.ok) {
+        /* 把响应体前 160 字带上：招行拒绝时返回的是 HTML 拦截页，
+           光看 `HTTP 403` 分不清是风控还是接口挂了 */
+        const body = await r.text().catch(() => '')
+        throw new Error(`HTTP ${r.status} ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`)
+      }
+      const text = await r.text()
+      /* jina 会在前面加 `Title:` / `URL Source:` / `Markdown Content:` 几行，截 {} 段 */
+      const raw = t.wrap ? text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1) : text
+      return JSON.parse(raw)
+    } catch (e) {
+      const code = e?.cause?.code || e?.code || e?.name || ''
+      const msg = String(e?.message || e).replace(/\s+/g, ' ').slice(0, 200)
+      errs.push(`${t.name}: ${msg}${code && !msg.includes(code) ? ` (${code})` : ''}`)
+    } finally {
+      clearTimeout(timer)
     }
-    json = await r.json()
-  } finally {
-    clearTimeout(timer)
   }
+  throw new Error(errs.join(' / '))
+}
+
+async function main() {
+  const json = await getRateJson()
 
   if (json?.returnCode !== 'SUC0000' || !Array.isArray(json?.body)) {
     throw new Error(`招行返回异常：${JSON.stringify(json).slice(0, 200)}`)
