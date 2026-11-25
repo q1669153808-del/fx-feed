@@ -40,6 +40,13 @@ function isoDate(s) {
   return m ? `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}` : ''
 }
 
+/**
+ * 🔴 浏览器 UA（2026-11-25）：GitHub 的出口 IP 在海外，招行接口对非浏览器 UA
+ * 偶尔直接拒绝（1 秒内挂掉，不是超时）。本机同样的代码 100% 成功，
+ * 说明不是接口改版 —— 换成浏览器 UA 少一个被风控的点。
+ */
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
 async function main() {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS)
@@ -47,9 +54,18 @@ async function main() {
   try {
     const r = await fetch(API + Date.now(), {
       signal: ac.signal,
-      headers: { 'user-agent': 'fx-feed/1.0 (+https://github.com)' },
+      headers: {
+        'user-agent': UA,
+        accept: 'application/json, text/plain, */*',
+        referer: 'https://fx.cmbchina.com/',
+      },
     })
-    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    if (!r.ok) {
+      /* 把响应体前 160 字带上：招行拒绝时返回的是 HTML 拦截页，
+         光看 `HTTP 403` 分不清是风控还是接口挂了 */
+      const body = await r.text().catch(() => '')
+      throw new Error(`HTTP ${r.status} ${String(body).replace(/\s+/g, ' ').slice(0, 160)}`)
+    }
     json = await r.json()
   } finally {
     clearTimeout(timer)
@@ -95,6 +111,10 @@ async function main() {
 
 main().catch((e) => {
   // 失败就让 Action 变红：宁可看到红灯，也不要悄悄提交一份空数据
-  console.error('FAIL', e.message)
+  const msg = String(e?.message || e).replace(/\s+/g, ' ').slice(0, 300)
+  console.error('FAIL', msg)
+  /* GitHub Actions 注解：失败原因的**前 300 字**直接写在运行摘要里，
+     手机上点开这一轮就能看到是 HTTP 403 还是超时，不用翻日志。 */
+  if (process.env.GITHUB_ACTIONS) console.log(`::error::${msg}`)
   process.exit(1)
 })

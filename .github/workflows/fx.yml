@@ -1,0 +1,82 @@
+name: fx-feed
+
+# 每小时抓一次招行牌价（第 17 分钟）。
+#
+# 为什么不写 `0 * * * *`：GitHub 文档明确说整点是负载最高的时段，
+# 定时任务会被延迟，极端情况直接丢弃排队的那一轮。错开 17 分钟避开整点。
+#
+# 为什么不是 5 分钟：公司记账只需要「这一天用的是银行真牌价」，不需要秒级。
+# 每小时跑一次，一天有 24 次机会；某一轮被丢掉，下一轮自动补上，
+# 不会出现「整天没价」。同时提交次数从 288 次/天降到 24 次/天，仓库不会虚胖。
+#
+# 🔴 为什么「抓牌价」要重试（2026-11-18）：
+# 那天 14:12、15:26 两轮都挂在「抓牌价」这一步（招行接口偶发超时/非 200），
+# 16:17 那轮又被 GitHub 延迟到 17:11 —— 结果 13:08 之后整整 4 小时没价。
+# 一次抖动就废掉一整小时，代价太大；改成退避重试 3 次（20s / 40s），
+# 只对「偶发网络失败」有效，接口真挂了照样红，不会把错误藏起来。
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch: # 手动跑一次，装完先验证
+
+permissions:
+  contents: write
+
+# 上一轮没跑完就别再开一轮，避免两个 job 同时 push 打架
+concurrency:
+  group: fx-feed
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # 最坏情况：3 次抓取（各 20s 超时）+ 20s + 40s 退避 ≈ 2 分钟，
+    # 加上 checkout / setup-node，留 10 分钟足够；不设太大是怕真卡住时占着并发位
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - name: 抓牌价
+        # 退避重试 3 次：20s / 40s。只吃掉「偶发超时 / 临时非 200」，
+        # 接口真挂了三次都失败 → 整个 job 变红，不会悄悄提交空数据。
+        run: |
+          for i in 1 2 3; do
+            if node scripts/fetch.mjs; then
+              exit 0
+            fi
+            if [ "$i" -lt 3 ]; then
+              wait_s=$((i * 20))
+              echo "::warning::第 $i 次抓取失败，${wait_s}s 后重试"
+              sleep "$wait_s"
+            fi
+          done
+          echo "::error::连续 3 次抓取失败，这一轮放弃（下一小时会自动再试）"
+          exit 1
+
+      - name: 有变化才提交
+        # 🔴 2026-11-24 用户看到这一步「0 秒失败」：他在手机上点了「重新运行」，
+        #    重跑的是几小时前的旧 run，checkout 停在旧 commit，而远端早就前进了 ——
+        #    本地 commit 完之后 `git push` 被拒（non-fast-forward，exit 1，0 秒）。
+        #    修法：提交前先把 index 对齐远端，再把 fx.json 的改动叠上去。
+        #    `reset --mixed` 只动 index 不动工作区，新抓的价不会丢；
+        #    也因为它先把基础换代了，重跑旧 run 同样能推上去。
+        run: |
+          set -euo pipefail
+          git config user.name  "fx-feed-bot"
+          git config user.email "fx-feed-bot@users.noreply.github.com"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git fetch --depth=1 origin "$BRANCH"
+          git reset --mixed FETCH_HEAD
+          git add -- fx.json
+          # 🔴 先对齐再 diff：文件还没被跟踪时 `git diff` 恒为空（第一轮会被误判成没变化）；
+          #    对齐之后判空，才不会把「远端已经是同一个价」重复提交一次。
+          if git diff --cached --quiet; then
+            echo "牌价没变，跳过提交"
+            exit 0
+          fi
+          git commit -m "fx $(date -u +%FT%TZ)"
+          git push origin "HEAD:$BRANCH"
