@@ -1,0 +1,48 @@
+name: fx-schedule
+
+# 🔴 第 274 轮：fx.yml 的 `schedule` 从 2026-11-25 01:38 起就没再排队过
+# （GitHub API 查 actions/runs：最近 6 次全是 workflow_dispatch / push，
+#  event=schedule 一条也没有；workflow state 仍是 active，手动能跑）。
+# 那个文件当天被删过一次、重新加回来，GitHub 的调度器显然没重新登记。
+# 这里放一个**独立的新文件**：新文件名 = 新的 workflow id，调度器会重新建档。
+# 与 fx.yml 共用 concurrency group，两者同时触发也不会打架。
+on:
+  schedule:
+    - cron: '8,38 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fx-feed
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+      - name: 抓牌价
+        run: |
+          for i in 1 2 3; do
+            if node scripts/fetch.mjs; then exit 0; fi
+            if [ "$i" -lt 3 ]; then wait_s=$((i * 20)); echo "::warning::第 $i 次失败，${wait_s}s 后重试"; sleep "$wait_s"; fi
+          done
+          echo "::error::连续 3 次抓取失败"; exit 1
+      - name: 有变化才提交
+        run: |
+          set -euo pipefail
+          git config user.name  "fx-feed-bot"
+          git config user.email "fx-feed-bot@users.noreply.github.com"
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          git fetch --depth=1 origin "$BRANCH"
+          git reset --mixed FETCH_HEAD
+          git add -- fx.json
+          if git diff --cached --quiet; then echo "牌价没变，跳过提交"; exit 0; fi
+          git commit -m "fx $(date -u +%FT%TZ)"
+          git push origin "HEAD:$BRANCH"
